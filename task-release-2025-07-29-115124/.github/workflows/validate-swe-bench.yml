@@ -1,0 +1,211 @@
+name: SWE-bench Data Point Validator with Real Evaluation
+
+on:
+  pull_request:
+    paths:
+      - 'data_points/**/*.json'
+  push:
+    branches: [main]
+    paths:
+      - 'data_points/**/*.json'
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    
+    - name: Setup Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+    
+    - name: Install UV
+      run: |
+        curl -LsSf https://astral.sh/uv/install.sh | sh
+        echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+    
+    - name: Install system dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y git build-essential
+    
+    - name: Install Python dependencies
+      run: |
+        # Установка через UV для быстроты
+        uv pip install --system swe-bench pytest docker
+        
+        # Дополнительные зависимости для разных репозиториев
+        uv pip install --system numpy matplotlib scipy scikit-learn django
+    
+    - name: Setup Docker
+      uses: docker/setup-buildx-action@v3
+    
+    - name: Get changed files
+      id: changed-files
+      uses: tj-actions/changed-files@v40
+      with:
+        files: |
+          data_points/**/*.json
+    
+    - name: Quick Structure Validation
+      if: steps.changed-files.outputs.any_changed == 'true'
+      run: |
+        echo "🔍 Быстрая структурная проверка измененных файлов:"
+        echo "${{ steps.changed-files.outputs.all_changed_files }}"
+        
+        # Сначала только структурная проверка (быстро)
+        python validator.py --no-evaluation --verbose ${{ steps.changed-files.outputs.all_changed_files }}
+        
+        echo "✅ Структурная проверка пройдена"
+    
+    - name: Real SWE-bench Evaluation
+      if: steps.changed-files.outputs.any_changed == 'true'
+      run: |
+        echo "🚀 Запуск РЕАЛЬНОГО SWE-bench evaluation:"
+        echo "⚠️  Это может занять несколько минут..."
+        
+        # Создаем список файлов
+        FILES="${{ steps.changed-files.outputs.all_changed_files }}"
+        
+        # Запускаем полную валидацию с реальным SWE-bench evaluation
+        echo "Файлы для валидации: $FILES"
+        
+        # Запускаем валидатор с подробными логами
+        python validator.py --verbose --timeout 600 $FILES
+        
+        VALIDATION_EXIT_CODE=$?
+        
+        if [ $VALIDATION_EXIT_CODE -eq 0 ]; then
+          echo "✅ ВСЕ data points прошли SWE-bench evaluation!"
+        else
+          echo "❌ Некоторые data points НЕ ПРОШЛИ SWE-bench evaluation"
+          exit 1
+        fi
+    
+    - name: Generate Validation Report
+      if: steps.changed-files.outputs.any_changed == 'true'
+      run: |
+        echo "📊 Генерация детального отчета валидации:"
+        
+        FILES="${{ steps.changed-files.outputs.all_changed_files }}"
+        
+        # Генерируем JSON отчет
+        python validator.py --json --verbose $FILES > validation_report.json
+        
+        echo "📋 Краткий отчет:"
+        python -c "
+        import json
+        with open('validation_report.json') as f:
+            results = json.load(f)
+        
+        print(f'Всего файлов: {len(results)}')
+        
+        valid_count = sum(1 for r in results if r['valid'])
+        print(f'Валидных: {valid_count}/{len(results)}')
+        
+        for result in results:
+            file_name = result['file']
+            status = '✅ VALID' if result['valid'] else '❌ INVALID'
+            print(f'{status}: {file_name}')
+            
+            if result.get('swe_bench_evaluation'):
+                swe = result['swe_bench_evaluation']
+                if swe.get('patch_applied'):
+                    print(f'  🔧 Патч применен: ✅')
+                else:
+                    print(f'  🔧 Патч применен: ❌')
+                
+                if swe.get('tests_passed'):
+                    print(f'  🧪 Тесты пройдены: ✅')
+                else:
+                    print(f'  🧪 Тесты пройдены: ❌')
+                
+                fail_to_pass = swe.get('fail_to_pass_results', {})
+                if fail_to_pass:
+                    passed = sum(1 for r in fail_to_pass.values() if r['passed'])
+                    total = len(fail_to_pass)
+                    emoji = '✅' if passed == total else '❌'
+                    print(f'  📈 FAIL_TO_PASS: {passed}/{total} {emoji}')
+                
+                pass_to_pass = swe.get('pass_to_pass_results', {})
+                if pass_to_pass:
+                    passed = sum(1 for r in pass_to_pass.values() if r['passed'])
+                    total = len(pass_to_pass)
+                    emoji = '✅' if passed == total else '❌'
+                    print(f'  📊 PASS_TO_PASS: {passed}/{total} {emoji} (sample)')
+            
+            print()
+        "
+    
+    - name: Upload validation report
+      if: steps.changed-files.outputs.any_changed == 'true'
+      uses: actions/upload-artifact@v3
+      with:
+        name: swe-bench-validation-report
+        path: validation_report.json
+    
+    - name: Repository Statistics (on main)
+      if: github.ref == 'refs/heads/main' && steps.changed-files.outputs.any_changed == 'true'
+      run: |
+        echo "📊 Статистика репозитория SWE-bench data points:"
+        
+        # Подсчет по репозиториям
+        echo "Распределение по репозиториям:"
+        find data_points -name "*.json" -type f | xargs grep -h '"repo"' | \
+          cut -d'"' -f4 | sort | uniq -c | sort -nr | head -10
+        
+        echo ""
+        echo "Общая статистика:"
+        echo "Всего data points: $(find data_points -name '*.json' | wc -l)"
+        
+        # Быстрая проверка первых 5 файлов для статистики
+        SAMPLE_FILES=$(find data_points -name "*.json" | head -5)
+        if [ ! -z "$SAMPLE_FILES" ]; then
+          echo ""
+          echo "Статистическая проверка (sample 5 файлов):"
+          python validator.py --no-evaluation $SAMPLE_FILES
+        fi
+    
+    - name: Performance Metrics
+      if: steps.changed-files.outputs.any_changed == 'true'
+      run: |
+        echo "⏱️ Метрики производительности валидации:"
+        
+        # Время валидации
+        if [ -f validation_report.json ]; then
+          python -c "
+          import json, datetime
+          with open('validation_report.json') as f:
+              results = json.load(f)
+          
+          total_files = len(results)
+          total_evaluation_time = 0
+          
+          for result in results:
+              swe = result.get('swe_bench_evaluation', {})
+              if swe and swe.get('evaluation_success') is not None:
+                  total_evaluation_time += 1  # Примерное время на файл
+          
+          print(f'Файлов обработано: {total_files}')
+          print(f'Примерное время SWE-bench evaluation: ~{total_evaluation_time * 30} секунд')
+          print(f'Среднее время на файл: ~30 секунд')
+          "
+        fi
+    
+    - name: No changes detected
+      if: steps.changed-files.outputs.any_changed == 'false'
+      run: |
+        echo "ℹ️ Изменений в data_points не обнаружено"
+        echo "Валидация пропущена"
+        echo ""
+        echo "💡 Для тестирования валидатора:"
+        echo "1. Добавьте новый .json файл в data_points/"
+        echo "2. Измените существующий data point"
+        echo "3. Создайте Pull Request"
+        
