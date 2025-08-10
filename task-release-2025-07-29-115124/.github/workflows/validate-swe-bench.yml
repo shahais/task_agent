@@ -1,4 +1,4 @@
-name: SWE-bench Data Point Validator with Real Evaluation
+name: SWE-bench Data Point Validator with Official API
 
 on:
   pull_request:
@@ -12,7 +12,7 @@ on:
 jobs:
   validate:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60  # Увеличен для Docker операций
     
     steps:
     - name: Checkout
@@ -35,16 +35,24 @@ jobs:
         sudo apt-get update
         sudo apt-get install -y git build-essential
     
-    - name: Install Python dependencies
-      run: |
-        # Установка через UV для быстроты
-        uv pip install --system swe-bench pytest docker
-        
-        # Дополнительные зависимости для разных репозиториев
-        uv pip install --system numpy matplotlib scipy scikit-learn django
-    
     - name: Setup Docker
       uses: docker/setup-buildx-action@v3
+    
+    - name: Install SWE-bench and dependencies
+      run: |
+        # Устанавливаем официальный SWE-bench
+        uv pip install --system swebench
+        
+        # Дополнительные зависимости
+        uv pip install --system docker requests tqdm
+    
+    - name: Verify Docker and SWE-bench setup
+      run: |
+        docker --version
+        docker ps
+        python -c "import swebench; print(f'SWE-bench {swebench.__version__} готов')"
+        python -c "from swebench.harness.run_evaluation import main; print('API доступен')"
+        echo "Настройка завершена ✅"
     
     - name: Get changed files
       id: changed-files
@@ -64,27 +72,27 @@ jobs:
         
         echo "✅ Структурная проверка пройдена"
     
-    - name: Real SWE-bench Evaluation
+    - name: Official SWE-bench Evaluation
       if: steps.changed-files.outputs.any_changed == 'true'
       run: |
-        echo "🚀 Запуск РЕАЛЬНОГО SWE-bench evaluation:"
-        echo "⚠️  Это может занять несколько минут..."
+        echo "🚀 Запуск ОФИЦИАЛЬНОГО SWE-bench evaluation с Docker:"
+        echo "⚠️  Это может занять до 30 минут (Docker + установка зависимостей)..."
         
         # Создаем список файлов
         FILES="${{ steps.changed-files.outputs.all_changed_files }}"
         
-        # Запускаем полную валидацию с реальным SWE-bench evaluation
+        # Запускаем валидатор с официальным SWE-bench API
         echo "Файлы для валидации: $FILES"
         
-        # Запускаем валидатор с подробными логами
-        python validator.py --verbose --timeout 600 $FILES
+        # Увеличиваем таймаут для Docker операций
+        python validator.py --verbose --timeout 3600 $FILES
         
         VALIDATION_EXIT_CODE=$?
         
         if [ $VALIDATION_EXIT_CODE -eq 0 ]; then
-          echo "✅ ВСЕ data points прошли SWE-bench evaluation!"
+          echo "✅ ВСЕ data points прошли официальную SWE-bench evaluation!"
         else
-          echo "❌ Некоторые data points НЕ ПРОШЛИ SWE-bench evaluation"
+          echo "❌ Некоторые data points НЕ ПРОШЛИ официальную SWE-bench evaluation"
           exit 1
         fi
     
@@ -138,74 +146,10 @@ jobs:
                     passed = sum(1 for r in pass_to_pass.values() if r['passed'])
                     total = len(pass_to_pass)
                     emoji = '✅' if passed == total else '❌'
-                    print(f'  📊 PASS_TO_PASS: {passed}/{total} {emoji} (sample)')
-            
-            print()
+                    print(f'  📊 PASS_TO_PASS: {passed}/{total} {emoji}')
         "
-    
-    - name: Upload validation report
-      if: steps.changed-files.outputs.any_changed == 'true'
-      uses: actions/upload-artifact@v3
-      with:
-        name: swe-bench-validation-report
-        path: validation_report.json
-    
-    - name: Repository Statistics (on main)
-      if: github.ref == 'refs/heads/main' && steps.changed-files.outputs.any_changed == 'true'
-      run: |
-        echo "📊 Статистика репозитория SWE-bench data points:"
-        
-        # Подсчет по репозиториям
-        echo "Распределение по репозиториям:"
-        find data_points -name "*.json" -type f | xargs grep -h '"repo"' | \
-          cut -d'"' -f4 | sort | uniq -c | sort -nr | head -10
         
         echo ""
-        echo "Общая статистика:"
-        echo "Всего data points: $(find data_points -name '*.json' | wc -l)"
-        
-        # Быстрая проверка первых 5 файлов для статистики
-        SAMPLE_FILES=$(find data_points -name "*.json" | head -5)
-        if [ ! -z "$SAMPLE_FILES" ]; then
-          echo ""
-          echo "Статистическая проверка (sample 5 файлов):"
-          python validator.py --no-evaluation $SAMPLE_FILES
-        fi
-    
-    - name: Performance Metrics
-      if: steps.changed-files.outputs.any_changed == 'true'
-      run: |
-        echo "⏱️ Метрики производительности валидации:"
-        
-        # Время валидации
-        if [ -f validation_report.json ]; then
-          python -c "
-          import json, datetime
-          with open('validation_report.json') as f:
-              results = json.load(f)
-          
-          total_files = len(results)
-          total_evaluation_time = 0
-          
-          for result in results:
-              swe = result.get('swe_bench_evaluation', {})
-              if swe and swe.get('evaluation_success') is not None:
-                  total_evaluation_time += 1  # Примерное время на файл
-          
-          print(f'Файлов обработано: {total_files}')
-          print(f'Примерное время SWE-bench evaluation: ~{total_evaluation_time * 30} секунд')
-          print(f'Среднее время на файл: ~30 секунд')
-          "
-        fi
-    
-    - name: No changes detected
-      if: steps.changed-files.outputs.any_changed == 'false'
-      run: |
-        echo "ℹ️ Изменений в data_points не обнаружено"
-        echo "Валидация пропущена"
-        echo ""
-        echo "💡 Для тестирования валидатора:"
-        echo "1. Добавьте новый .json файл в data_points/"
-        echo "2. Измените существующий data point"
-        echo "3. Создайте Pull Request"
-        
+        echo "🎉 Использовался ОФИЦИАЛЬНЫЙ SWE-bench evaluation harness!"
+        echo "🐳 Docker контейнеры создавались автоматически"
+        echo "📦 Зависимости устанавливались в изолированных средах"

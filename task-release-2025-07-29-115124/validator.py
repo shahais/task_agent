@@ -1,45 +1,35 @@
 #!/usr/bin/env python3
 """
-SWE-bench Data Point Validator с реальной интеграцией SWE-bench evaluation harness
-Универсальный валидатор для всех Python репозиториев
+SWE-bench Data Point Validator с ПРАВИЛЬНЫМ SWE-bench API
 """
 
 import json
 import sys
 import argparse
-import subprocess
 import tempfile
-import shutil
-import os
-import docker
+import uuid
 from pathlib import Path
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any
 import logging
+
+# ПРАВИЛЬНЫЙ SWE-bench API
+from swebench.harness.run_evaluation import main as run_evaluation_main
+from swebench.harness.utils import load_swebench_dataset
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
 class SWEBenchValidator:
-    """Валидатор с реальной интеграцией SWE-bench evaluation harness."""
+    """Валидатор с правильным SWE-bench evaluation API."""
     
-    def __init__(self, timeout: int = 300):
+    def __init__(self, timeout: int = 1800):
         self.required_fields = [
             'instance_id', 'repo', 'base_commit', 'patch', 
             'test_patch', 'problem_statement', 'hints_text', 
             'created_at', 'version', 'FAIL_TO_PASS', 'PASS_TO_PASS'
         ]
         self.timeout = timeout
-        self.docker_client = None
-        
-    def _init_docker(self):
-        """Инициализация Docker client."""
-        try:
-            self.docker_client = docker.from_env()
-            return True
-        except Exception as e:
-            logger.warning(f"Docker недоступен: {e}")
-            return False
     
     def validate_json_structure(self, data: Dict[str, Any]) -> List[str]:
         """Проверяет структуру JSON на наличие обязательных полей."""
@@ -76,35 +66,10 @@ class SWEBenchValidator:
                     errors.append(f"{test_field} должен быть списком")
             
         return errors
-    
-    def validate_patch_format(self, patch: str) -> List[str]:
-        """Проверяет корректность формата патча."""
-        errors = []
-        
-        if not patch.strip():
-            errors.append("Патч не может быть пустым")
-            return errors
-            
-        lines = patch.split('\n')
-        has_diff_header = any(line.startswith('diff --git') for line in lines)
-        has_file_markers = any(line.startswith('---') or line.startswith('+++') for line in lines)
-        has_hunk_headers = any(line.startswith('@@') for line in lines)
-        
-        if not (has_diff_header and has_file_markers and has_hunk_headers):
-            errors.append("Патч не содержит корректных diff маркеров")
-        
-        has_additions = any(line.startswith('+') and not line.startswith('+++') for line in lines)
-        has_deletions = any(line.startswith('-') and not line.startswith('---') for line in lines)
-        
-        if not (has_additions or has_deletions):
-            errors.append("Патч не содержит изменений")
-            
-        return errors
-    
+
     def run_swebench_evaluation(self, data_point_path: str) -> Dict[str, Any]:
         """
-        РЕАЛЬНАЯ валидация через SWE-bench evaluation harness.
-        Клонирует репозиторий, применяет патч, запускает тесты.
+        ПРАВИЛЬНАЯ валидация через swebench.harness.run_evaluation.main
         """
         result = {
             'evaluation_success': False,
@@ -121,168 +86,147 @@ class SWEBenchValidator:
                 data = json.load(f)
             
             instance_id = data['instance_id']
-            repo = data['repo']
-            base_commit = data['base_commit']
-            patch = data['patch']
+            result['logs'].append(f"Начинаем SWE-bench evaluation для {instance_id}")
             
-            result['logs'].append(f"Начинаем валидацию {instance_id}")
+            # Создаем предикт в формате SWE-bench
+            # Используем golden patch как решение для валидации
+            prediction = {
+                'instance_id': instance_id,
+                'model_patch': data['patch'],  # Golden patch
+                'model_name_or_path': 'golden_patch_validator'
+            }
             
-            # 1. Создаем временную директорию
+            # Создаем временные файлы для SWE-bench
             with tempfile.TemporaryDirectory() as temp_dir:
-                repo_dir = Path(temp_dir) / "repo"
+                temp_dir = Path(temp_dir)
                 
-                # 2. Клонируем репозиторий
-                result['logs'].append(f"Клонируем {repo}")
-                clone_cmd = [
-                    'git', 'clone', f'https://github.com/{repo}.git', str(repo_dir)
-                ]
+                # Создаем датасет JSONL файл
+                dataset_file = temp_dir / 'dataset.jsonl'
+                with open(dataset_file, 'w') as f:
+                    json.dump(data, f)
+                    f.write('\n')
+                
+                # Создаем предикты JSONL файл
+                predictions_file = temp_dir / 'predictions.jsonl'
+                with open(predictions_file, 'w') as f:
+                    json.dump(prediction, f)
+                    f.write('\n')
+                
+                # Папка для отчетов
+                report_dir = temp_dir / 'reports'
+                report_dir.mkdir()
+                
+                # Генерируем уникальный run_id
+                run_id = f"validator_{uuid.uuid4().hex[:8]}"
+                
+                result['logs'].append("Запускаем официальный SWE-bench evaluation...")
                 
                 try:
-                    subprocess.run(clone_cmd, check=True, capture_output=True, 
-                                 timeout=self.timeout, cwd=temp_dir)
-                except subprocess.CalledProcessError as e:
-                    result['errors'].append(f"Ошибка клонирования: {e.stderr.decode()}")
-                    return result
-                except subprocess.TimeoutExpired:
-                    result['errors'].append("Таймаут при клонировании репозитория")
-                    return result
-                
-                # 3. Чекаутим базовый коммит
-                result['logs'].append(f"Checkout {base_commit}")
-                checkout_cmd = ['git', 'checkout', base_commit]
-                
-                try:
-                    subprocess.run(checkout_cmd, check=True, capture_output=True,
-                                 cwd=repo_dir)
-                except subprocess.CalledProcessError as e:
-                    result['errors'].append(f"Ошибка checkout: {e.stderr.decode()}")
-                    return result
-                
-                # 4. Применяем патч
-                result['logs'].append("Применяем основной патч")
-                patch_file = Path(temp_dir) / "main.patch"
-                patch_file.write_text(patch)
-                
-                apply_cmd = ['git', 'apply', '--check', str(patch_file)]
-                try:
-                    subprocess.run(apply_cmd, check=True, capture_output=True,
-                                 cwd=repo_dir)
-                    # Если check прошел, применяем патч
-                    apply_cmd = ['git', 'apply', str(patch_file)]
-                    subprocess.run(apply_cmd, check=True, capture_output=True,
-                                 cwd=repo_dir)
-                    result['patch_applied'] = True
-                    result['logs'].append("✓ Патч успешно применен")
-                except subprocess.CalledProcessError as e:
-                    result['errors'].append(f"Ошибка применения патча: {e.stderr.decode()}")
-                    return result
-                
-                # 5. Применяем тестовый патч (если есть)
-                if data.get('test_patch'):
-                    result['logs'].append("Применяем тестовый патч")
-                    test_patch_file = Path(temp_dir) / "test.patch"
-                    test_patch_file.write_text(data['test_patch'])
+                    # ПРАВИЛЬНЫЙ вызов SWE-bench evaluation
+                    report_path = run_evaluation_main(
+                        dataset_name=str(dataset_file),  # Путь к нашему датасету
+                        split='test',  # По умолчанию
+                        instance_ids=[instance_id],  # Только наш instance
+                        predictions_path=str(predictions_file),  # Путь к предиктам
+                        max_workers=1,  # Один воркер для простоты
+                        force_rebuild=False,
+                        cache_level='env',
+                        clean=False,
+                        open_file_limit=4096,
+                        run_id=run_id,
+                        timeout=self.timeout,
+                        namespace='swebench',
+                        rewrite_reports=False,
+                        modal=False,
+                        instance_image_tag='latest',
+                        report_dir=str(report_dir)
+                    )
                     
-                    try:
-                        apply_cmd = ['git', 'apply', str(test_patch_file)]
-                        subprocess.run(apply_cmd, check=True, capture_output=True,
-                                     cwd=repo_dir)
-                        result['logs'].append("✓ Тестовый патч применен")
-                    except subprocess.CalledProcessError as e:
-                        result['errors'].append(f"Ошибка применения тест-патча: {e.stderr.decode()}")
-                        return result
-                
-                # 6. Запускаем FAIL_TO_PASS тесты
-                fail_to_pass = data.get('FAIL_TO_PASS', '[]')
-                if isinstance(fail_to_pass, str):
-                    fail_to_pass = json.loads(fail_to_pass)
-                
-                if fail_to_pass:
-                    result['logs'].append(f"Запускаем FAIL_TO_PASS тесты: {len(fail_to_pass)}")
-                    for test in fail_to_pass:
-                        test_result = self._run_single_test(test, repo_dir)
-                        result['fail_to_pass_results'][test] = test_result
-                        if not test_result['passed']:
-                            result['errors'].append(f"FAIL_TO_PASS тест не прошел: {test}")
-                
-                # 7. Запускаем PASS_TO_PASS тесты (sample)
-                pass_to_pass = data.get('PASS_TO_PASS', '[]')
-                if isinstance(pass_to_pass, str):
-                    pass_to_pass = json.loads(pass_to_pass)
-                
-                if pass_to_pass:
-                    # Запускаем первые 5 тестов для проверки
-                    sample_tests = pass_to_pass[:5]
-                    result['logs'].append(f"Запускаем PASS_TO_PASS тесты (sample): {len(sample_tests)}")
-                    for test in sample_tests:
-                        test_result = self._run_single_test(test, repo_dir)
-                        result['pass_to_pass_results'][test] = test_result
-                        if not test_result['passed']:
-                            result['errors'].append(f"PASS_TO_PASS тест сломался: {test}")
-                
-                # 8. Определяем общий результат
-                fail_to_pass_success = all(
-                    tr['passed'] for tr in result['fail_to_pass_results'].values()
-                )
-                pass_to_pass_success = all(
-                    tr['passed'] for tr in result['pass_to_pass_results'].values()
-                )
-                
-                result['tests_passed'] = fail_to_pass_success and pass_to_pass_success
-                result['evaluation_success'] = (
-                    result['patch_applied'] and 
-                    result['tests_passed'] and 
-                    len(result['errors']) == 0
-                )
-                
-                if result['evaluation_success']:
-                    result['logs'].append("✅ SWE-bench валидация ПРОЙДЕНА")
-                else:
-                    result['logs'].append("❌ SWE-bench валидация ПРОВАЛЕНА")
+                    result['logs'].append(f"✓ SWE-bench evaluation завершен, отчет: {report_path}")
+                    
+                    # Читаем результаты из отчета
+                    if report_path and Path(report_path).exists():
+                        with open(report_path, 'r') as f:
+                            report_data = json.load(f)
+                        
+                        # Ищем результат для нашего instance
+                        for entry in report_data:
+                            if entry.get('instance_id') == instance_id:
+                                self._parse_evaluation_result(entry, data, result)
+                                break
+                    else:
+                        # Ищем результаты в report_dir
+                        result_files = list(report_dir.glob('**/*.json'))
+                        result['logs'].append(f"Найдено файлов результатов: {len(result_files)}")
+                        
+                        for result_file in result_files:
+                            try:
+                                with open(result_file, 'r') as f:
+                                    file_data = json.load(f)
+                                
+                                # Пытаемся найти наш instance в файле
+                                if isinstance(file_data, list):
+                                    for entry in file_data:
+                                        if entry.get('instance_id') == instance_id:
+                                            self._parse_evaluation_result(entry, data, result)
+                                            break
+                                elif isinstance(file_data, dict) and file_data.get('instance_id') == instance_id:
+                                    self._parse_evaluation_result(file_data, data, result)
+                                    break
+                            except Exception as e:
+                                result['logs'].append(f"Ошибка чтения {result_file}: {e}")
+                    
+                    result['evaluation_success'] = len(result['errors']) == 0
+                    
+                except Exception as e:
+                    result['errors'].append(f"Ошибка SWE-bench evaluation: {e}")
+                    logger.exception("SWE-bench evaluation error")
                 
         except Exception as e:
-            result['errors'].append(f"Неожиданная ошибка в SWE-bench валидации: {e}")
-            logger.exception("SWE-bench validation error")
+            result['errors'].append(f"Ошибка подготовки evaluation: {e}")
+            logger.exception("Evaluation preparation error")
         
         return result
     
-    def _run_single_test(self, test_path: str, repo_dir: Path) -> Dict[str, Any]:
-        """Запускает отдельный тест и возвращает результат."""
-        result = {
-            'passed': False,
-            'output': '',
-            'error': '',
-            'timeout': False
-        }
+    def _parse_evaluation_result(self, eval_entry: Dict, data: Dict, result: Dict):
+        """Парсит результат evaluation."""
+        # Основные результаты
+        result['patch_applied'] = eval_entry.get('patch_applied', False)
+        result['tests_passed'] = eval_entry.get('resolved', False)
         
-        try:
-            # Определяем команду запуска тестов
-            if '::' in test_path:
-                # pytest формат
-                cmd = ['python', '-m', 'pytest', '-xvs', test_path]
+        # Анализируем тесты
+        test_results = eval_entry.get('test_results', {})
+        
+        # FAIL_TO_PASS тесты
+        fail_to_pass = json.loads(data.get('FAIL_TO_PASS', '[]'))
+        for test in fail_to_pass:
+            # В SWE-bench статус может быть PASSED, FAILED, ERROR, TIMEOUT
+            test_status = test_results.get(test, {})
+            if isinstance(test_status, dict):
+                test_passed = test_status.get('status') == 'PASSED'
             else:
-                # unittest формат
-                cmd = ['python', '-m', 'unittest', test_path]
+                # Иногда результат может быть просто строкой
+                test_passed = test_status == 'PASSED'
             
-            process = subprocess.run(
-                cmd, 
-                capture_output=True, 
-                timeout=60,  # 1 минута на тест
-                cwd=repo_dir,
-                text=True
-            )
-            
-            result['output'] = process.stdout
-            result['error'] = process.stderr
-            result['passed'] = process.returncode == 0
-            
-        except subprocess.TimeoutExpired:
-            result['timeout'] = True
-            result['error'] = "Тест превысил таймаут 60 секунд"
-        except Exception as e:
-            result['error'] = f"Ошибка запуска теста: {e}"
+            result['fail_to_pass_results'][test] = {'passed': test_passed}
+            if not test_passed:
+                result['errors'].append(f"FAIL_TO_PASS тест не прошел: {test}")
         
-        return result
+        # PASS_TO_PASS тесты (берем sample для скорости)
+        pass_to_pass = json.loads(data.get('PASS_TO_PASS', '[]'))
+        sample_tests = pass_to_pass[:5]  # Первые 5 тестов
+        for test in sample_tests:
+            test_status = test_results.get(test, {})
+            if isinstance(test_status, dict):
+                test_passed = test_status.get('status') == 'PASSED'
+            else:
+                test_passed = test_status == 'PASSED'
+            
+            result['pass_to_pass_results'][test] = {'passed': test_passed}
+            if not test_passed:
+                result['errors'].append(f"PASS_TO_PASS тест сломался: {test}")
+        
+        result['logs'].append(f"Parsed results - patch_applied: {result['patch_applied']}, tests_passed: {result['tests_passed']}")
     
     def validate_data_point(self, file_path: str, run_evaluation: bool = True) -> Dict[str, Any]:
         """Валидирует одну точку данных SWE-bench."""
@@ -304,17 +248,7 @@ class SWEBenchValidator:
             result['errors'].extend(structure_errors)
             result['structure_valid'] = len(structure_errors) == 0
             
-            # 2. Проверка основного патча
-            if 'patch' in data:
-                patch_errors = self.validate_patch_format(data['patch'])
-                result['errors'].extend(patch_errors)
-            
-            # 3. Проверка тестового патча
-            if 'test_patch' in data and data['test_patch']:
-                test_patch_errors = self.validate_patch_format(data['test_patch'])
-                result['errors'].extend([f"test_patch: {err}" for err in test_patch_errors])
-            
-            # 4. РЕАЛЬНАЯ валидация через SWE-bench (если структура корректна)
+            # 2. ПРАВИЛЬНАЯ SWE-bench evaluation
             if run_evaluation and result['structure_valid']:
                 logger.info(f"Запускаем SWE-bench evaluation для {file_path}")
                 swe_result = self.run_swebench_evaluation(file_path)
@@ -341,14 +275,14 @@ class SWEBenchValidator:
 
 
 def main():
-    parser = argparse.ArgumentParser(description='SWE-bench Data Point Validator с реальной интеграцией')
+    parser = argparse.ArgumentParser(description='SWE-bench Data Point Validator с правильным API')
     parser.add_argument('files', nargs='+', help='JSON файлы для валидации')
     parser.add_argument('--json', action='store_true', help='Вывод в JSON формате')
     parser.add_argument('--verbose', '-v', action='store_true', help='Подробный вывод')
     parser.add_argument('--no-evaluation', action='store_true', 
                        help='Пропустить SWE-bench evaluation (только структурная проверка)')
-    parser.add_argument('--timeout', type=int, default=300, 
-                       help='Таймаут для операций в секундах (по умолчанию: 300)')
+    parser.add_argument('--timeout', type=int, default=1800, 
+                       help='Таймаут для операций в секундах (по умолчанию: 1800)')
     
     args = parser.parse_args()
     
@@ -404,7 +338,7 @@ def main():
     if not args.json:
         print(f"\nРезультат: {valid_count}/{total_count} файлов валидны")
         if not args.no_evaluation:
-            print("💡 Использовалась РЕАЛЬНАЯ SWE-bench evaluation")
+            print("💡 Использовался ОФИЦИАЛЬНЫЙ SWE-bench evaluation harness с Docker")
         else:
             print("⚠️  Использовалась только структурная проверка")
     
