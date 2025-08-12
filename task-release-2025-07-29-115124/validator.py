@@ -12,7 +12,6 @@ from pathlib import Path
 from typing import Dict, List, Any
 import logging
 
-# ПРАВИЛЬНЫЙ SWE-bench API
 from swebench.harness.run_evaluation import main as run_evaluation_main
 from swebench.harness.utils import load_swebench_dataset
 
@@ -39,14 +38,12 @@ class SWEBenchValidator:
             if field not in data:
                 errors.append(f"Отсутствует обязательное поле: {field}")
         
-        # Проверяем типы данных
         if 'instance_id' in data and not isinstance(data['instance_id'], str):
             errors.append("instance_id должен быть строкой")
             
         if 'repo' in data and not isinstance(data['repo'], str):
             errors.append("repo должен быть строкой")
         
-        # Проверяем формат instance_id
         if 'instance_id' in data:
             instance_id = data['instance_id']
             if not instance_id or '__' not in instance_id:
@@ -96,7 +93,6 @@ class SWEBenchValidator:
                 'model_name_or_path': 'golden_patch_validator'
             }
             
-            # Создаем временные файлы для SWE-bench
             with tempfile.TemporaryDirectory() as temp_dir:
                 temp_dir = Path(temp_dir)
                 
@@ -112,23 +108,20 @@ class SWEBenchValidator:
                     json.dump(prediction, f)
                     f.write('\n')
                 
-                # Папка для отчетов
                 report_dir = temp_dir / 'reports'
                 report_dir.mkdir()
                 
-                # Генерируем уникальный run_id
                 run_id = f"validator_{uuid.uuid4().hex[:8]}"
                 
                 result['logs'].append("Запускаем официальный SWE-bench evaluation...")
                 
                 try:
-                    # ПРАВИЛЬНЫЙ вызов SWE-bench evaluation
                     report_path = run_evaluation_main(
-                        dataset_name=str(dataset_file),  # Путь к нашему датасету
-                        split='test',  # По умолчанию
-                        instance_ids=[instance_id],  # Только наш instance
-                        predictions_path=str(predictions_file),  # Путь к предиктам
-                        max_workers=1,  # Один воркер для простоты
+                        dataset_name=str(dataset_file),
+                        split='test',
+                        instance_ids=[instance_id],
+                        predictions_path=str(predictions_file),
+                        max_workers=1,
                         force_rebuild=False,
                         cache_level='env',
                         clean=False,
@@ -144,7 +137,6 @@ class SWEBenchValidator:
                     
                     result['logs'].append(f"✓ SWE-bench evaluation завершен, отчет: {report_path}")
                     
-                    # ИСПРАВЛЕНИЕ: Правильно читаем результаты из отчета
                     if report_path and Path(report_path).exists():
                         with open(report_path, 'r') as f:
                             report_data = json.load(f)
@@ -152,7 +144,6 @@ class SWEBenchValidator:
                         # Парсим результат в формате SWE-bench evaluation
                         self._parse_swebench_report(report_data, instance_id, data, result)
                     else:
-                        # Ищем результаты в report_dir
                         result_files = list(report_dir.glob('**/*.json'))
                         result['logs'].append(f"Найдено файлов результатов: {len(result_files)}")
                         
@@ -161,7 +152,6 @@ class SWEBenchValidator:
                                 with open(result_file, 'r') as f:
                                     file_data = json.load(f)
                                 
-                                # ИСПРАВЛЕНИЕ: Правильно парсим файл результатов
                                 self._parse_swebench_report(file_data, instance_id, data, result)
                                 break  # Выходим после первого найденного результата
                             except Exception as e:
@@ -180,7 +170,7 @@ class SWEBenchValidator:
         return result
     
     def _parse_swebench_report(self, report_data: Dict, instance_id: str, data: Dict, result: Dict):
-        """ИСПРАВЛЕННАЯ функция парсинга отчета SWE-bench."""
+        """Парсинг отчета SWE-bench."""
         try:
             # Формат отчета SWE-bench:
             # {
@@ -239,13 +229,12 @@ class SWEBenchValidator:
             result['errors'].extend(structure_errors)
             result['structure_valid'] = len(structure_errors) == 0
             
-            # 2. SWE-bench evaluation (если требуется)
+            # 2. SWE-bench evaluation
             if run_evaluation and result['structure_valid']:
                 logger.info(f"Запускаем SWE-bench evaluation для {file_path}")
                 evaluation_result = self.run_swebench_evaluation(file_path)
                 result['swe_bench_evaluation'] = evaluation_result
                 
-                # Добавляем ошибки evaluation
                 if not evaluation_result['evaluation_success']:
                     result['errors'].extend(evaluation_result['errors'])
             
@@ -285,6 +274,34 @@ class SWEBenchValidator:
             }
         }
 
+    def get_test_details(self, file_path: str) -> Dict[str, Any]:
+        """Извлекает информацию о тестах из data point."""
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            
+            fail_to_pass = []
+            pass_to_pass = []
+            
+            if 'FAIL_TO_PASS' in data:
+                if isinstance(data['FAIL_TO_PASS'], str):
+                    fail_to_pass = json.loads(data['FAIL_TO_PASS'])
+                else:
+                    fail_to_pass = data['FAIL_TO_PASS']
+            
+            if 'PASS_TO_PASS' in data:
+                if isinstance(data['PASS_TO_PASS'], str):
+                    pass_to_pass = json.loads(data['PASS_TO_PASS'])
+                else:
+                    pass_to_pass = data['PASS_TO_PASS']
+            
+            return {
+                'fail_to_pass': fail_to_pass,
+                'pass_to_pass': pass_to_pass
+            }
+        except Exception as e:
+            return {'fail_to_pass': [], 'pass_to_pass': [], 'error': str(e)}
+
 
 def main():
     parser = argparse.ArgumentParser(description='SWE-bench Data Point Validator')
@@ -295,6 +312,8 @@ def main():
                        help='Timeout для evaluation (секунды)')
     parser.add_argument('--verbose', action='store_true',
                        help='Подробный вывод')
+    parser.add_argument('--show-tests', action='store_true',
+                   help='Показать список тестов')                   
     
     args = parser.parse_args()
     
@@ -320,13 +339,25 @@ def main():
             print(f"  SWE-bench evaluation:")
             print(f"    Patch applied: {'✓' if eval_result['patch_applied'] else '✗'}")
             print(f"    Tests passed: {'✓' if eval_result['tests_passed'] else '✗'}")
+            
+            test_details = validator.get_test_details(result['file'])
+            
+            if test_details['fail_to_pass']:
+                print(f"    FAIL_TO_PASS тесты ({len(test_details['fail_to_pass'])}):")
+                for test in test_details['fail_to_pass']:
+                    # Для resolved instances все FAIL_TO_PASS должны пройти
+                    test_status = "✓ PASS" if eval_result['tests_passed'] else "✗ FAIL"
+                    print(f"      {test_status} {test}")
+            
+            if test_details['pass_to_pass']:
+                print(f"    PASS_TO_PASS тесты ({len(test_details['pass_to_pass'])}):")
+                for test in test_details['pass_to_pass']:
+                    # Для resolved instances все PASS_TO_PASS должны пройти
+                    test_status = "✓ PASS" if eval_result['tests_passed'] else "? UNKNOWN"
+                    print(f"      {test_status} {test}")
     
     # Общая статистика
     summary = batch_result['summary']
-    print(f"\nРезультат: {summary['valid']}/{summary['total']} файлов валидны")
-    print("💡 Использовался ОФИЦИАЛЬНЫЙ SWE-bench evaluation harness с Docker")
-    
-    # Код возврата
     sys.exit(0 if summary['valid'] == summary['total'] else 1)
 
 
